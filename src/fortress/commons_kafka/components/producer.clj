@@ -7,7 +7,7 @@
 
 (defn create-producer
   "Return KafkaProducer.
-   It's mandatory to inform the fields:
+   It's mandatory to inform the keys in the config:
     - :bootstrap-servers
     - :key.serializer (default: org.apache.kafka.common.serialization.Serdes/String)
     - :value.serializer (default: org.apache.kafka.common.serialization.Serdes/String)"
@@ -39,8 +39,10 @@
 
 (defn send-message! 
   "Send message to topic"
-  [producer record]
-  (.send producer record))
+  ([producer record]
+   (.send producer record))
+  ([producer record callback]
+   (.send producer record callback)))
 
 (defn send!
   "Creates Producer, ProduceRecord and sends message"
