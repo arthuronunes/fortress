@@ -1,22 +1,23 @@
 (ns fortress.commons-kafka.components.producer
   (:require [clojure.walk :as walk]
-            [clojure.set :as set]
-            [fortress.commons-kafka.configs.serdes :as f-serdes])
+            [clojure.spec.alpha :as s]
+            [fortress.commons-kafka.configs.serdes :as f-serdes]
+            [fortress.commons-kafka.configs.specs :as f-specs])
   (:import [org.apache.kafka.clients.producer
             KafkaProducer ProducerRecord]))
 
 (defn create-producer
   "Return KafkaProducer.
    It's mandatory to inform the keys in the config:
-    - :bootstrap-servers
-    - :key.serializer (default: org.apache.kafka.common.serialization.Serdes/String)
-    - :value.serializer (default: org.apache.kafka.common.serialization.Serdes/String)"
+    - :bootstrap-servers => String
+    - :key.serializer => String (default: org.apache.kafka.common.serialization.StringSerializer)
+    - :value.serializer => String (default: org.apache.kafka.common.serialization.StringSerializer)"
   [config]
-  {:pre [(set/subset? #{:bootstrap.servers} (set (keys config)))]}
-  (KafkaProducer. (walk/stringify-keys (merge (f-serdes/string-serializer)
+  {:pre [(s/valid? ::f-specs/config-producer config)]}
+  (KafkaProducer. (walk/stringify-keys (merge f-serdes/config-string-serializer
                                               config))))
 
-(defn ^:private add-headers-in-record! 
+(defn ^:private add-headers-in-record!
   "Add headers map in record"
   [record headers]
   (let [record-headers (.headers record)]
@@ -25,7 +26,7 @@
             (name k)
             (into-array Byte/TYPE (map byte v))))))
 
-(defn ->record 
+(defn ->record
   "Generate ProduceRecord from the fields:
      - topic-name 
      - key 
@@ -37,7 +38,7 @@
       (add-headers-in-record! record headers))
     record))
 
-(defn send-message! 
+(defn send-message!
   "Send message to topic"
   ([producer record]
    (.send producer record))
