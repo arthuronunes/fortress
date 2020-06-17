@@ -6,5 +6,5 @@
 
 (deftest send!-test 
   (testing "sending message to local kafka"
-    (f-producer/send! util/config-broker-local util/topic-teste2 "id-msg-1423" (f-data/map->string-json {:a 1 :v 2 :b {:a 1234}}))
+    (f-producer/send! util/config-broker-local util/topic-teste2 "id-msg-2" (f-data/map->string-json {:a 1 :v 2 :b {:a 2}}))
     true))

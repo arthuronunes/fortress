@@ -13,6 +13,7 @@
 
 (defn ^:private send-topic-retry-dlq
   [value key {:keys [config-producer config-topic]}]
+  (clojure.pprint/pprint value)
   (f-producer/send! config-producer
                     (:topic-name config-topic)
                     key

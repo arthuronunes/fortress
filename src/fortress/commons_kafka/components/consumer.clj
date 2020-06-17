@@ -6,7 +6,8 @@
             [fortress.commons-kafka.configs.retry :as f-retry]
             [fortress.commons-kafka.configs.log :as log])
   (:import [org.apache.kafka.clients.consumer
-            KafkaConsumer]
+            KafkaConsumer OffsetAndMetadata]
+           [org.apache.kafka.common TopicPartition]
            java.time.Duration
            java.util.UUID))
 
@@ -58,17 +59,46 @@
     (throw (ex-info "It's mandatory to inform one of the keys [:topics or :pattern]" {:config config}))))
 
 (defn consumer-init [consumer-info]
-  (let [*running? (ref true)
+  (let [*running? (atom true)
         stoped (promise)]
-    {:*running? *running?
-     :stop #(alter *running? (fn [_]
-                               (log/info "Stop consumer-run!" consumer-info)
-                               (deliver stoped true)
-                               false))
-     :stoped stoped
-     :*count (ref 0)
-     :*messages (ref (clojure.lang.PersistentQueue/EMPTY))
-     :*pause? (ref false)}))
+    (merge consumer-info
+           {:*running? *running?
+            :stop #(swap! *running? (fn [_]
+                                      (log/info "Stoping consumer-run!" consumer-info)
+                                      (deliver stoped true)
+                                      false))
+            :stoped stoped
+            :*count (atom 0)
+            :*messages (atom clojure.lang.PersistentQueue/EMPTY)
+            :*processed-messages (atom clojure.lang.PersistentQueue/EMPTY)
+            :*pause? (atom false)})))
+
+(defn ^:private next-message!
+  [*queue]
+  (let [peek-pop (juxt peek pop)
+        [message new-queue] (peek-pop @*queue)]
+    (when message
+      (swap! *queue (constantly new-queue)))
+    message))
+
+(defn ^:private next-message-processing!
+  [{:keys [*messages *count]}]
+  (when-let [message (next-message! *messages)]
+    (swap! *count inc)
+    message))
+
+(defn commit-processed-messages! [consumer consumer-status]
+  (try
+    (when-let [message-commit (next-message! (:*processed-messages consumer-status))]
+      (.commitSync consumer message-commit (Duration/ofMillis 10000)))
+    (catch Exception e
+      (throw (ex-info "Error function commit-processed-messages!" {:consumer-status consumer-status
+                                                                   :exception e})))))
+
+(defn add-processed-messages! [{:keys [*processed-messages]} record]
+  (let [topic-partition-offset {(TopicPartition. (.topic record) (.partition record))
+                                (OffsetAndMetadata. (inc (.offset record)))}]
+    (swap! *processed-messages #(conj % topic-partition-offset))))
 
 (defn ^:private consumer-handler
   [{:keys [handler handler-exception]} record]
@@ -76,54 +106,70 @@
     (handler record)
     (catch Exception e
       (log/error "Error processing message" {:record record} e)
-      (when handler-exception
-        (handler-exception record e)))))
-
-(defn ^:private next-message
-  [consumer-status]
-  #_TODO
-  #_GET_NEXT_MESSAGE
-  #_UPDATE_LIST_MESSAGES
-  (alter (:*count consumer-status) inc))
+      (try
+        (when handler-exception
+          (handler-exception record e))
+        (catch Exception ex
+          (log/error "Error processing handler-exception" {:record record} ex))))))
 
 (defn ^:private handler-run!
   [config-run consumer-status]
-  (while @(:*running? consumer-status)
-    (when-let [record (next-message consumer-status)]
-      (consumer-handler config-run record))))
+  (try
+    (while @(:*running? consumer-status)
+      (when-let [record (next-message-processing! consumer-status)]
+        (consumer-handler config-run record)
+        (add-processed-messages! consumer-status record)))
+    (catch Exception e
+      (log/error "Error function handler-run!" {:config-run config-run
+                                                :consumer-status consumer-status} e))))
 
 (defn resume-consumer
-  [consumer consumer-status]
-  #_TODO
-  #_RESUME_NO_CONSUMER
-  #_ATUALIZAR_REF_*PAUSE?)
+  [consumer {:keys [*pause?]}]
+  (.resume consumer (.assignment consumer))
+  (swap! *pause? (constantly false)))
 
 (defn pause-consumer
-  [consumer consumer-status]
-  #_TODO
-  #_PAUSE_NO_CONSUMER
-  #_ATUALIZAR_REF_*PAUSE?)
+  [consumer {:keys [*pause?]}]
+  (.pause consumer (.assignment consumer))
+  (swap! *pause? (constantly true)))
 
 (defn message-limit-exceeded?
   [{:keys [*messages]}]
-  (> 1000 (count @(*messages))))
+  (> (count @*messages) 1))
 
-(defn add-records
-  [records consumer-status]
-  #_TODO
-  #_ADD_RECORDS_IN_LIST)
+(defn ^:private add-queue [messages records]
+  (reduce (fn [acc rec] (conj acc rec)) messages records))
+
+(defn add-records!
+  [records {:keys [*messages]}]
+  (swap! *messages #(add-queue % records)))
 
 (defn ^:private poll! [consumer consumer-status]
-  (while @(:*running? consumer-status)
+  (try
     (let [{:keys [*pause?]} consumer-status
           exceeded? (message-limit-exceeded? consumer-status)]
-      (if (not @(*pause?))
-        (if exceeded?
-          (pause-consumer consumer consumer-status)
-          (let [records (.poll consumer (Duration/ofMillis 2000))]
-            (add-records records consumer-status)))
+      (if (not @*pause?)
+        (when exceeded?
+          (pause-consumer consumer consumer-status))
         (when (not exceeded?)
-          (resume-consumer consumer consumer-status))))))
+          (resume-consumer consumer consumer-status)))
+      (let [records (.poll consumer (Duration/ofMillis 1000))]
+        (add-records! records consumer-status)))
+    (catch Exception e
+      (throw (ex-info "Error function poll!" {:consumer-status consumer-status
+                                              :exception e})))))
+
+(defn ^:private consumer-processing
+  [consumer consumer-status]
+  (try
+    (while @(:*running? consumer-status)
+      (poll! consumer consumer-status)
+      (commit-processed-messages! consumer consumer-status))
+    (catch Exception e
+      (let [{:keys [exception] :as exception-data} (ex-data e)]
+        (log/error (ex-message e) (dissoc exception-data :exception) exception)))
+    (finally
+      (.close consumer))))
 
 (defn ^:private consumer-run!
   [{:keys [instance client-id]} config-run]
@@ -132,16 +178,14 @@
     (future
       (try
         (log/info "Init consumer-run!" consumer-info)
-        (dosync
-         (future (poll! instance consumer-status))
-         (future (handler-run! config-run consumer-status)))
+        (future (consumer-processing instance consumer-status))
+        (future (handler-run! config-run consumer-status))
         @(:stoped consumer-status)
+        (log/info "Stopedd consumer-run!" consumer-info)
         (catch Exception e
           (.printStackTrace e)
-          (log/error "Error consumer-run!" consumer-info e)
-          ((:stop consumer-status)))
-        (finally
-          (.close instance))))
+          (log/error "Error function consumer-run!" consumer-info e)
+          ((:stop consumer-status)))))
     consumer-status))
 
 (defn consumer-run
@@ -203,10 +247,11 @@
 
   (def conff {:consumer {:config-consumer {:bootstrap.servers "localhost:9092"
                                            :group.id "my-group-fortress6"
-                                           :auto.offset.reset "earliest"}
+                                           :auto.offset.reset "earliest"
+                                           :enable.auto.commit false}
                          :topics ["TOPIC-1" "TOPIC-2"]
                         ;;  :pattern #"TOP.*"
-                         :config-run {:handler (fn [record] (prn (.value record)) (throw (ex-info "error!" {:record record})))
+                         :config-run {:handler (fn [record] (prn (.value record)) (Thread/sleep 1000) (throw (ex-info "error!" {:record record})))
                                       :handler-exception (fn [record ex] (prn "DEU ERRO MESMO!!"))
                                       :auto-retry? true
                                       :consumer-dlq? true}}
@@ -223,12 +268,29 @@
               :dlq {:config-topic {:topic-name "TOPIC-X-DLQ"
                                    :replications 2
                                    :partitions 2}
-                    :config-run {:handler (fn [record] (prn "CHEGOU NO DLQ"))}}})
+                    :config-run {:handler (fn [record] (prn "CHEGOU NO DLQ"))
+                                 :auto-retry? true
+                                 :consumer-dlq? true}}})
+
+  (s/explain ::f-specs/consumer-component conff)
 
   (def mc2 (consumer conff))
 
   ((:stop (:status (:dlq-consumer-component mc2))))
   ((:stop (:status (:retry-consumer-component mc2))))
   ((:stop (:status (:consumer-component mc2))))
+
+
+  (def messagexxx (peek @(:*processed-messages (:status (:consumer-component mc2)))))
+  (let [instance (:instance (:consumer (:consumer-component mc2)))]
+    (.commitSync instance messagexxx (Duration/ofMillis 1000)))
+
+  (reset! (:*messages (:status (:consumer-component mc2))) clojure.lang.PersistentQueue/EMPTY)
+
+  (def fila {:a (ref clojure.lang.PersistentQueue/EMPTY)})
+
+  (dosync
+   (let [{:keys [a]} fila]
+     (alter a conj 1)))
 
   #_())
