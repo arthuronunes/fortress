@@ -13,7 +13,6 @@
 
 (defn ^:private send-topic-retry-dlq
   [value key {:keys [config-producer config-topic]}]
-  (clojure.pprint/pprint value)
   (f-producer/send! config-producer
                     (:topic-name config-topic)
                     key
@@ -30,17 +29,25 @@
         (send-topic-retry-dlq (.key record) (retry-or-dlq retry dlq record e)))
     (handler-exception record e)))
 
+(defn delay-processing [{:keys [timestamp]} delay-seg]
+  (let [now (inst-ms (java.util.Date.))
+        delay-ms (* delay-seg 1000)
+        difference (- now timestamp)]
+    (when (and (pos? difference) 
+               (< difference delay-ms))
+      (Thread/sleep (- difference delay-ms)))))
+
 (defn ^:private consumer-handler-retry [{:keys [config-run]} {:keys [delay-seg]}]
   (let [handler (:handler config-run)]
     (fn [record]
-      (prn "entrou retry" delay-seg)
-      (Thread/sleep (* delay-seg 1000))
-      (-> (.value record)
-          f-data/string-json->map
-          :record
-          (assoc :timestamp (.timestamp record))
-          f-data/map->consumer-record
-          handler))))
+      (let [origin-record (-> (.value record)
+                              f-data/string-json->map
+                              :record)]
+        (delay-processing origin-record delay-seg)
+        (-> origin-record
+            (assoc :timestamp (.timestamp record))
+            f-data/map->consumer-record
+            handler)))))
 
 (defn update-new-attempt [record timestamp]
   (-> record

@@ -69,36 +69,45 @@
                                       false))
             :stoped stoped
             :*count (atom 0)
+            :processed (atom false)
             :*messages (atom clojure.lang.PersistentQueue/EMPTY)
-            :*processed-messages (atom clojure.lang.PersistentQueue/EMPTY)
+            :*processed-messages (atom {})
+            :*commit-messages (atom clojure.lang.PersistentQueue/EMPTY)
             :*pause? (atom false)})))
 
 (defn ^:private next-message!
   [*queue]
-  (let [peek-pop (juxt peek pop)
-        [message new-queue] (peek-pop @*queue)]
+  (let [message (peek @*queue)]
     (when message
-      (swap! *queue (constantly new-queue)))
+      (swap! *queue pop))
     message))
 
-(defn ^:private next-message-processing!
+(defn ^:private next-processing-message!
   [{:keys [*messages *count]}]
   (when-let [message (next-message! *messages)]
     (swap! *count inc)
     message))
 
-(defn commit-processed-messages! [consumer consumer-status]
+(defn next-commit-messages! [processed-messages *commit-messages]
+  (reset! *commit-messages processed-messages)
+  {})
+
+(defn commit-processed-messages!
+  [consumer {:keys [*processed-messages *commit-messages] :as consumer-status}]
   (try
-    (when-let [message-commit (next-message! (:*processed-messages consumer-status))]
-      (.commitSync consumer message-commit (Duration/ofMillis 10000)))
+    (when (not-empty @*processed-messages)
+      (swap! *processed-messages next-commit-messages! *commit-messages)
+      (.commitSync consumer @*commit-messages (Duration/ofMillis 1000))
+      (reset! *commit-messages clojure.lang.PersistentQueue/EMPTY))
     (catch Exception e
-      (throw (ex-info "Error function commit-processed-messages!" {:consumer-status consumer-status
+      (throw (ex-info "Error function commit-processed-messages!" {:fn-processing :commit!
+                                                                   :consumer-status consumer-status
                                                                    :exception e})))))
 
 (defn add-processed-messages! [{:keys [*processed-messages]} record]
-  (let [topic-partition-offset {(TopicPartition. (.topic record) (.partition record))
-                                (OffsetAndMetadata. (inc (.offset record)))}]
-    (swap! *processed-messages #(conj % topic-partition-offset))))
+  (let [topic-partition (TopicPartition. (.topic record) (.partition record))
+        offset (OffsetAndMetadata. (inc (.offset record)))]
+    (swap! *processed-messages assoc topic-partition offset)))
 
 (defn ^:private consumer-handler
   [{:keys [handler handler-exception]} record]
@@ -113,15 +122,18 @@
           (log/error "Error processing handler-exception" {:record record} ex))))))
 
 (defn ^:private handler-run!
-  [config-run consumer-status]
+  [config-run {:keys [*running? processed stop] :as consumer-status}]
   (try
-    (while @(:*running? consumer-status)
-      (when-let [record (next-message-processing! consumer-status)]
+    (while @*running?
+      (reset! processed (promise))
+      (when-let [record (next-processing-message! consumer-status)]
         (consumer-handler config-run record)
-        (add-processed-messages! consumer-status record)))
+        (add-processed-messages! consumer-status record))
+      (deliver @processed true))
     (catch Exception e
       (log/error "Error function handler-run!" {:config-run config-run
-                                                :consumer-status consumer-status} e))))
+                                                :consumer-status consumer-status} e)
+      (stop))))
 
 (defn resume-consumer
   [consumer {:keys [*pause?]}]
@@ -156,17 +168,23 @@
       (let [records (.poll consumer (Duration/ofMillis 1000))]
         (add-records! records consumer-status)))
     (catch Exception e
-      (throw (ex-info "Error function poll!" {:consumer-status consumer-status
+      (throw (ex-info "Error function poll!" {:fn-processing :poll!
+                                              :consumer-status consumer-status
                                               :exception e})))))
 
 (defn ^:private consumer-processing
-  [consumer consumer-status]
+  [consumer {:keys [*running? processed] :as consumer-status}]
   (try
-    (while @(:*running? consumer-status)
+    (while @*running?
       (poll! consumer consumer-status)
       (commit-processed-messages! consumer consumer-status))
     (catch Exception e
-      (let [{:keys [exception] :as exception-data} (ex-data e)]
+      ((:stop consumer))
+      (when @processed
+        @@processed)
+      (let [{:keys [exception fn-processing] :as exception-data} (ex-data e)]
+        (when (= fn-processing :poll!)
+          (commit-processed-messages! consumer consumer-status))
         (log/error (ex-message e) (dissoc exception-data :exception) exception)))
     (finally
       (.close consumer))))
@@ -251,8 +269,8 @@
                                            :enable.auto.commit false}
                          :topics ["TOPIC-1" "TOPIC-2"]
                         ;;  :pattern #"TOP.*"
-                         :config-run {:handler (fn [record] (prn (.value record)) (Thread/sleep 1000) (throw (ex-info "error!" {:record record})))
-                                      :handler-exception (fn [record ex] (prn "DEU ERRO MESMO!!"))
+                         :config-run {:handler (fn [record] #_(prn (.value record)) #_(Thread/sleep 1000) (throw (ex-info "error!" {:record record})))
+                                      :handler-exception (fn [record ex] nil #_(prn "DEU ERRO MESMO!!"))
                                       :auto-retry? true
                                       :consumer-dlq? true}}
               :retry {:config-topic {:topic-name "TOPIC-X-RETRY"
@@ -268,11 +286,9 @@
               :dlq {:config-topic {:topic-name "TOPIC-X-DLQ"
                                    :replications 2
                                    :partitions 2}
-                    :config-run {:handler (fn [record] (prn "CHEGOU NO DLQ"))
+                    :config-run {:handler (fn [record] nil #_(prn "CHEGOU NO DLQ"))
                                  :auto-retry? true
                                  :consumer-dlq? true}}})
-
-  (s/explain ::f-specs/consumer-component conff)
 
   (def mc2 (consumer conff))
 
@@ -280,17 +296,6 @@
   ((:stop (:status (:retry-consumer-component mc2))))
   ((:stop (:status (:consumer-component mc2))))
 
-
-  (def messagexxx (peek @(:*processed-messages (:status (:consumer-component mc2)))))
-  (let [instance (:instance (:consumer (:consumer-component mc2)))]
-    (.commitSync instance messagexxx (Duration/ofMillis 1000)))
-
-  (reset! (:*messages (:status (:consumer-component mc2))) clojure.lang.PersistentQueue/EMPTY)
-
-  (def fila {:a (ref clojure.lang.PersistentQueue/EMPTY)})
-
-  (dosync
-   (let [{:keys [a]} fila]
-     (alter a conj 1)))
+  @(:*count (:status (:consumer-component mc2)))
 
   #_())
