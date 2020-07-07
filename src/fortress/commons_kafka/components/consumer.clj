@@ -26,11 +26,13 @@
      - :topics => [String] 
      - :pattern => java.util.regex.Pattern (case inform the two keys, it will be used)
    If the client.id field not informed, it will be generated automatically a uuid"
-  [config]
+  [config instance-number]
   {:pre [(s/valid? ::f-specs/config-consumer config)]}
   (let [config-consumer (dissoc config :topics :pattern)
-        config-with-defaults (merge (config-consumer-defaults)
-                                    config-consumer)
+        config-with-defaults (update (merge (config-consumer-defaults)
+                                            config-consumer)
+                                     :client.id
+                                     str "-instance-" instance-number)
         config-string (walk/stringify-keys config-with-defaults)]
     {:instance (KafkaConsumer. config-string)
      :client-id (:client.id config-with-defaults)}))
@@ -198,10 +200,15 @@
   (consumer-run! kafka-consumer config-run))
 
 (defn create-consumer-component [{:keys [config-consumer config-run] :as consumer}]
-  (let [kafka-consumer (create-consumer config-consumer)]
-    (subscribe-topics kafka-consumer consumer)
-    {:consumer kafka-consumer
-     :status (consumer-run! kafka-consumer config-run)}))
+  (loop [i (:total-instances config-run)
+         consumers []]
+    (if (> i 0)
+      (let [kafka-consumer (create-consumer config-consumer i)]
+        (subscribe-topics kafka-consumer consumer)
+        (recur (dec i)
+               (conj consumers {:consumer kafka-consumer
+                                :status (consumer-run! kafka-consumer config-run)})))
+      consumers)))
 
 (defn create-consumer-component-retry-dlq
   [retry-dlq]
@@ -225,15 +232,15 @@
         (cond->> config-component
           auto-retry? f-retry/init-component-retry-dlq
           auto-retry? (add-consumer-component! component
-                                               create-consumer-component-retry-dlq 
+                                               create-consumer-component-retry-dlq
                                                :retry
                                                :retry-consumer-component)
           consumer-dlq? (add-consumer-component! component
-                                                 create-consumer-component-retry-dlq  
+                                                 create-consumer-component-retry-dlq
                                                  :dlq
                                                  :dlq-consumer-component)
           true (add-consumer-component! component
-                                        create-consumer-component 
+                                        create-consumer-component
                                         :consumer
                                         :consumer-component))
         @component)
@@ -251,10 +258,11 @@
                                            :enable.auto.commit false}
                          :topics ["TOPIC-1" "TOPIC-2"]
                         ;;  :pattern #"TOP.*"
-                         :config-run {:handler (fn [record] #_(prn (.value record)) #_(Thread/sleep 1000) (throw (ex-info "error!" {:record record})))
+                         :config-run {:handler (fn [record] #_(prn (.value record)) (Thread/sleep 1000) (throw (ex-info "error!" {:record record})))
                                       :handler-exception (fn [record ex] nil #_(prn "DEU ERRO MESMO!!"))
-                                      :auto-retry? true
-                                      :consumer-dlq? true}}
+                                      :auto-retry? false
+                                      :consumer-dlq? false
+                                      :total-instances 3}}
               :retry {:config-topic {:topic-name "TOPIC-X-RETRY"
                                      :replications 2
                                      :partitions 2}
@@ -276,7 +284,9 @@
 
   ((:stop (:status (:dlq-consumer-component mc2))))
   ((:stop (:status (:retry-consumer-component mc2))))
-  ((:stop (:status (:consumer-component mc2))))
+  ((:stop (:status (first (:consumer-component mc2)))))
+  ((:stop (:status (second (:consumer-component mc2)))))
+  ((:stop (:status (nth (:consumer-component mc2) 2))))
 
   @(:*count (:status (:consumer-component mc2)))
 
