@@ -33,7 +33,7 @@
   (let [now (inst-ms (java.util.Date.))
         delay-ms (* delay-seg 1000)
         difference (- now timestamp)]
-    (when (and (pos? difference) 
+    (when (and (pos? difference)
                (< difference delay-ms))
       (Thread/sleep (- difference delay-ms)))))
 
@@ -58,7 +58,7 @@
   (let [{:keys [retries]} retry]
     (fn [record _]
       (let [{:keys [timestamp value key]} (f-data/consumer-record->map record)
-            {:keys [retried max-retries] 
+            {:keys [retried max-retries]
              :or {max-retries retries}
              :as new-record} (update-new-attempt (f-data/string-json->map value) timestamp)]
         (if (< retried max-retries)
@@ -66,7 +66,7 @@
           (send-topic-retry-dlq new-record key dlq))))))
 
 (defn ^:private merge-consumer-with-retry-dlq
-  [{:keys [config-consumer config-run]} retry-dlq]
+  [retry-dlq {:keys [config-consumer config-run]}]
   (let [new-config-run (dissoc config-run :handler)]
     (-> retry-dlq
         (update :config-consumer #(merge config-consumer %))
@@ -81,8 +81,9 @@
                           (:config-topic dlq)]
                          (select-keys (:config-consumer consumer) [:bootstrap.servers]))
   (let [new-config-component (-> config-component
-                                 (update :retry #(merge-consumer-with-retry-dlq consumer %))
-                                 (update :dlq #(merge-consumer-with-retry-dlq consumer %)))]
+                                 (update :retry merge-consumer-with-retry-dlq consumer)
+                                 (update :dlq merge-consumer-with-retry-dlq consumer))]
     (-> new-config-component
         (assoc-in [:retry :config-run :handler] (consumer-handler-retry consumer retry))
-        (assoc-in [:retry :config-run :handler-exception] (consumer-handler-exception-retry new-config-component)))))
+        (assoc-in [:retry :config-run :handler-exception] (consumer-handler-exception-retry new-config-component))
+        (assoc-in [:consumer :config-run :handler-exception] (handler-exception-auto-retry (:config-run consumer) new-config-component)))))

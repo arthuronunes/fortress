@@ -72,15 +72,12 @@
             :processed (atom false)
             :*messages (atom clojure.lang.PersistentQueue/EMPTY)
             :*processed-messages (atom {})
-            :*commit-messages (atom clojure.lang.PersistentQueue/EMPTY)
             :*pause? (atom false)})))
 
 (defn ^:private next-message!
   [*queue]
-  (let [message (peek @*queue)]
-    (when message
-      (swap! *queue pop))
-    message))
+  (let [[old-queue _] (swap-vals! *queue pop)]
+    (peek old-queue)))
 
 (defn ^:private next-processing-message!
   [{:keys [*messages *count]}]
@@ -88,17 +85,12 @@
     (swap! *count inc)
     message))
 
-(defn next-commit-messages! [processed-messages *commit-messages]
-  (reset! *commit-messages processed-messages)
-  {})
-
 (defn commit-processed-messages!
-  [consumer {:keys [*processed-messages *commit-messages] :as consumer-status}]
+  [consumer {:keys [*processed-messages] :as consumer-status}]
   (try
     (when (not-empty @*processed-messages)
-      (swap! *processed-messages next-commit-messages! *commit-messages)
-      (.commitSync consumer @*commit-messages (Duration/ofMillis 1000))
-      (reset! *commit-messages clojure.lang.PersistentQueue/EMPTY))
+      (let [[old _] (reset-vals! *processed-messages {})]
+        (.commitSync consumer old (Duration/ofMillis 1000))))
     (catch Exception e
       (throw (ex-info "Error function commit-processed-messages!" {:fn-processing :commit!
                                                                    :consumer-status consumer-status
@@ -138,23 +130,20 @@
 (defn resume-consumer
   [consumer {:keys [*pause?]}]
   (.resume consumer (.assignment consumer))
-  (swap! *pause? (constantly false)))
+  (reset! *pause? false))
 
 (defn pause-consumer
   [consumer {:keys [*pause?]}]
   (.pause consumer (.assignment consumer))
-  (swap! *pause? (constantly true)))
+  (reset! *pause? true))
 
 (defn message-limit-exceeded?
   [{:keys [*messages]}]
-  (> (count @*messages) 1))
-
-(defn ^:private add-queue [messages records]
-  (reduce (fn [acc rec] (conj acc rec)) messages records))
+  (> (count @*messages) 1000))
 
 (defn add-records!
   [records {:keys [*messages]}]
-  (swap! *messages #(add-queue % records)))
+  (swap! *messages into records))
 
 (defn ^:private poll! [consumer consumer-status]
   (try
@@ -166,7 +155,8 @@
         (when (not exceeded?)
           (resume-consumer consumer consumer-status)))
       (let [records (.poll consumer (Duration/ofMillis 1000))]
-        (add-records! records consumer-status)))
+        (when (not-empty records)
+          (add-records! records consumer-status))))
     (catch Exception e
       (throw (ex-info "Error function poll!" {:fn-processing :poll!
                                               :consumer-status consumer-status
@@ -194,16 +184,11 @@
   (let [consumer-info {:client-id client-id}
         consumer-status (consumer-init consumer-info)]
     (future
-      (try
-        (log/info "Init consumer-run!" consumer-info)
-        (future (consumer-processing instance consumer-status))
-        (future (handler-run! config-run consumer-status))
-        @(:stoped consumer-status)
-        (log/info "Stopedd consumer-run!" consumer-info)
-        (catch Exception e
-          (.printStackTrace e)
-          (log/error "Error function consumer-run!" consumer-info e)
-          ((:stop consumer-status)))))
+      (log/info "Init consumer-run!" consumer-info)
+      (future (consumer-processing instance consumer-status))
+      (future (handler-run! config-run consumer-status))
+      @(:stoped consumer-status)
+      (log/info "Stopedd consumer-run!" consumer-info))
     consumer-status))
 
 (defn consumer-run
@@ -224,8 +209,8 @@
       (assoc :topics [(get-in retry-dlq [:config-topic :topic-name])])
       create-consumer-component))
 
-(defn add-consumer-component! [component consumer key config-component]
-  (swap! component assoc key consumer)
+(defn add-consumer-component! [component consumer-fn key-config key config-component]
+  (swap! component assoc key (consumer-fn (get config-component key-config)))
   config-component)
 
 (defn consumer
@@ -237,23 +222,20 @@
       (let [{:keys [config-run]} consumer
             {auto-retry? :auto-retry?
              consumer-dlq? :consumer-dlq?} config-run]
-        (cond-> config-component
+        (cond->> config-component
           auto-retry? f-retry/init-component-retry-dlq
-          auto-retry? (#(add-consumer-component! component
-                                                 (create-consumer-component-retry-dlq (:retry %))
-                                                 :retry-consumer-component
-                                                 %))
-          auto-retry? (#(assoc-in %
-                                  [:consumer :config-run :handler-exception]
-                                  (f-retry/handler-exception-auto-retry config-run %)))
-          consumer-dlq? (#(add-consumer-component! component
-                                                   (create-consumer-component-retry-dlq (:dlq %))
-                                                   :dlq-consumer-component
-                                                   %))
-          true (#(add-consumer-component! component
-                                          (create-consumer-component (:consumer %))
-                                          :consumer-component
-                                          %)))
+          auto-retry? (add-consumer-component! component
+                                               create-consumer-component-retry-dlq 
+                                               :retry
+                                               :retry-consumer-component)
+          consumer-dlq? (add-consumer-component! component
+                                                 create-consumer-component-retry-dlq  
+                                                 :dlq
+                                                 :dlq-consumer-component)
+          true (add-consumer-component! component
+                                        create-consumer-component 
+                                        :consumer
+                                        :consumer-component))
         @component)
       (catch Exception e
         (log/error "Component creation error" {:component config-component} e)
